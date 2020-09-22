@@ -7,6 +7,7 @@ import json
 import requests
 
 app = Flask('slack-app-gitlab-pipeline-runner')
+token = os.environ['SLACK_TOKEN']
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost')
 SECONDS_TO_WAIT_BETWEEN_POLLS = 4
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv('POLLING_THREADS', '4')))
