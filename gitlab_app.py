@@ -10,6 +10,7 @@ app = Flask('slack-app-gitlab-pipeline-runner')
 token = os.environ['SLACK_TOKEN']
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost')
 SECONDS_TO_WAIT_BETWEEN_POLLS = 4
+ROUTE = os.getenv('/')
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv('POLLING_THREADS', '4')))
 
 def handle_workflow_step_edit(event):
@@ -248,7 +249,7 @@ def poll():
             break
     return '', 200
 
-@app.route('/', methods=['POST', 'GET'])
+@app.route(ROUTE, methods=['POST', 'GET'])
 def event():
     if request.is_json:
         event = request.json
