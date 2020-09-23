@@ -1,7 +1,7 @@
 import time
 import concurrent.futures
 import os
-from flask import Flask, request
+from flask import Flask, request, Response
 import redis
 import json
 import requests
@@ -10,7 +10,7 @@ app = Flask('slack-app-gitlab-pipeline-runner')
 token = os.environ['SLACK_TOKEN']
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost')
 SECONDS_TO_WAIT_BETWEEN_POLLS = 4
-ROUTE = os.getenv('/')
+ROUTE = os.getenv('ROUTE', '/')
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv('POLLING_THREADS', '4')))
 
 def handle_workflow_step_edit(event):
@@ -164,12 +164,12 @@ def handle_workflow_step_edit(event):
           }
         }
     resp = requests.post('https://slack.com/api/views.open', json=payload, headers={'Authorization': 'Bearer ' + token, 'Content-Type': 'application/json; charset=utf-8'})
-    print(resp.json())
+    app.logger.debug(resp.json())
 
 def post_to_slack(method, json=None, params={}):
     resp = requests.post('https://slack.com/api/' + method, params=params, json=json, headers={'Content-Type': 'application/json; charset=utf-8', 'Authorization': 'Bearer ' + token})
     if resp.status_code != 200:
-        print(resp.json())
+        app.logger.warning(resp.json())
 
 def handle_view_submission(event):
     payload = {'workflow_step_edit_id': event['workflow_step']['workflow_step_edit_id']}
@@ -188,7 +188,7 @@ def handle_view_submission(event):
     post_to_slack('workflows.updateStep', json=payload)
 
 def format_variables_for_gitlab(variables):
-    return {'variables': [{'key': r.split('=')[0], 'value': r.split('=')[1]} for r in variables.split(':')]}
+    return {'variables': [{'key': r.split('=')[0].strip(), 'value': r.split('=')[1].strip()} for r in variables.split(':') if r.strip()]}
 
 def start_pipeline(inputs):
     personal_token = inputs['personal_token']['value']['value']
@@ -200,12 +200,24 @@ def start_pipeline(inputs):
     params = {'ref': ref}
     body = format_variables_for_gitlab(variables)
     resp = requests.post(url, headers={'private-token': personal_token}, params=params, json=body)
-    resp.raise_for_status()
+    try:
+        resp.raise_for_status()
+    except Exception:
+        app.logger.warning('bad response from gitlab')
+        app.logger.warning(resp.get_data())
+        raise
     return resp
 
 def handle_gitlab_pipeline_run(event):
     inputs = event['event']['workflow_step']['inputs']
-    resp = start_pipeline(inputs)
+    try:
+        resp = start_pipeline(inputs)
+    except Exception as e:
+        if inputs['announcement'].get('value', {}).get('selected_conversation'):
+            channel = inputs['announcement']['value']['selected_conversation']
+            resp = requests.post('https://slack.com/api/chat.postMessage', params={'text': 'pipeline execution failed', 'token': token, 'channel': channel})
+        post_to_slack('workflows.stepFailed', json={'workflow_step_execute_id': event['event']['workflow_step']['workflow_step_execute_id'], 'error': 'Unable to start pipeline. Got %s' % e})
+        return
     pipeline = {
             'event': event,
             'response': resp.json()
@@ -251,18 +263,20 @@ def poll():
 
 @app.route(ROUTE, methods=['POST', 'GET'])
 def event():
+    if request.json and 'challenge' in request.json:
+        return Response(request.json['challenge'], mimetype="text/plain")
     if request.is_json:
         event = request.json
     else:
         event = json.loads(request.form['payload'])
-    print(json.dumps(event, indent=2))
+    app.logger.debug(json.dumps(event, indent=2))
     if event['type'] == 'workflow_step_edit':
-        executor.submit(handle_workflow_step_edit, event)
+        handle_workflow_step_edit(event)
     elif event['type'] == 'view_submission':
-        executor.submit(handle_view_submission, event)
+        handle_view_submission(event)
     elif event['type'] == 'event_callback':
         if event['event']['type'] == 'workflow_step_execute' and event['event']['callback_id'] == 'run_gitlab_pipeline':
-            executor.submit(handle_gitlab_pipeline_run, event)
+            handle_gitlab_pipeline_run(event)
     return '', 200
 
 if __name__ == '__main__':
