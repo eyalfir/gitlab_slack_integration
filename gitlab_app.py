@@ -9,6 +9,8 @@ import requests
 app = Flask('slack-app-gitlab-pipeline-runner')
 token = os.environ['SLACK_TOKEN']
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost')
+redis_client = redis.Redis.from_url(REDIS_URL)
+redis_client.ping()
 SECONDS_TO_WAIT_BETWEEN_POLLS = 4
 ROUTE = os.getenv('ROUTE', '/')
 executor = concurrent.futures.ThreadPoolExecutor(max_workers=int(os.getenv('POLLING_THREADS', '4')))
@@ -188,6 +190,8 @@ def handle_view_submission(event):
     post_to_slack('workflows.updateStep', json=payload)
 
 def format_variables_for_gitlab(variables):
+    if not variables:
+        return None
     return {'variables': [{'key': r.split('=')[0].strip(), 'value': r.split('=')[1].strip()} for r in variables.split(':') if r.strip()]}
 
 def start_pipeline(inputs):
@@ -213,11 +217,12 @@ def handle_gitlab_pipeline_run(event):
     try:
         resp = start_pipeline(inputs)
     except Exception as e:
+        app.logger.warning('pipeline execution failed...')
         if inputs['announcement'].get('value', {}).get('selected_conversation'):
             channel = inputs['announcement']['value']['selected_conversation']
             resp = requests.post('https://slack.com/api/chat.postMessage', params={'text': 'pipeline execution failed', 'token': token, 'channel': channel})
         post_to_slack('workflows.stepFailed', json={'workflow_step_execute_id': event['event']['workflow_step']['workflow_step_execute_id'], 'error': 'Unable to start pipeline. Got %s' % e})
-        return
+        raise
     pipeline = {
             'event': event,
             'response': resp.json()
@@ -239,26 +244,30 @@ def handle_single_item(item_raw):
     ref = inputs['ref']['value']['value']
     url = '%s/api/v4/projects/%s/pipelines/%s' % (baseurl.rstrip('/'), project_id, pipeline_id)
     resp = requests.get(url, headers={'private-token': personal_token})
-    if resp.json()['status'] == 'success':
+    status = resp.json()['status']
+    web_url = resp.json()['web_url']
+    if status == 'success':
         if inputs['announcement'].get('value', {}).get('selected_conversation'):
             channel = inputs['announcement']['value']['selected_conversation']
             pipeline = inputs['display_name']['value']['value']
             requests.post('https://slack.com/api/chat.postMessage', params={'text': 'Pipeline *%s* finished successfully' % pipeline, 'token': token, 'channel': channel})
         post_to_slack('workflows.stepCompleted', json={'workflow_step_execute_id': item['event']['event']['workflow_step']['workflow_step_execute_id'], 'outputs': {'pipeline_id': pipeline_id, 'pipeline_link': item['response']['web_url']}})
         redis_client.zrem('pipelines', item_raw)
+    elif status == 'failed':
+        if inputs['announcement'].get('value', {}).get('selected_conversation'):
+            channel = inputs['announcement']['value']['selected_conversation']
+            pipeline = inputs['display_name']['value']['value']
+            requests.post('https://slack.com/api/chat.postMessage', params={'text': 'Pipeline *%s* (pipeline id <%s|%s>), exited with an error.' % (pipeline, web_url, pipeline_id), 'token': token, 'channel': channel})
+        post_to_slack('workflows.stepFailed', json={'workflow_step_execute_id': item['event']['event']['workflow_step']['workflow_step_execute_id'], 'error': 'Pipeline failed'})
+        redis_client.zrem('pipelines', item_raw)
 
 @app.route('/poll', methods=['POST'])
 def poll():
-    while True:
-        pair = next(iter(redis_client.zrange('pipelines', 0, 0, withscores=True)))
-        if not pair:
-            break
-        item_raw, t = pair
-        if time.time() - t > SECONDS_TO_WAIT_BETWEEN_POLLS:
-            redis_client.zadd('pipelines', {item_raw: time.time()}, xx=True)
-            executor.submit(handle_single_item, item_raw)
-        else:
-            break
+    time_to_poll_up = time.time() - SECONDS_TO_WAIT_BETWEEN_POLLS
+    items = redis_client.zrangebyscore('pipelines', min='-inf', max=time_to_poll_up)
+    for item_raw in items:
+        redis_client.zadd('pipelines', {item_raw: time.time()}, xx=True)
+        executor.submit(handle_single_item, item_raw)
     return '', 200
 
 @app.route(ROUTE, methods=['POST', 'GET'])
@@ -280,5 +289,4 @@ def event():
     return '', 200
 
 if __name__ == '__main__':
-    redis_client = redis.Redis.from_url(REDIS_URL)
     app.run('0.0.0.0', 4444)
